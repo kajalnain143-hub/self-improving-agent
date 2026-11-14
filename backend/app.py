@@ -58,9 +58,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_SCHEMA = os.getenv("DATABASE_SCHEMA", "self_improving_agent")
 
 
+def _database_configured():
+    # Render's dashboard must resolve database references before the app starts.
+    return bool(DATABASE_URL and not DATABASE_URL.startswith("${{"))
+
+
 def _db_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is required for persistent session storage")
+    if not _database_configured():
+        raise RuntimeError("A resolved DATABASE_URL is required for persistent session storage")
     return psycopg.connect(DATABASE_URL, connect_timeout=10)
 
 
@@ -79,6 +84,8 @@ def _init_session_storage():
 
 
 def _persist_session(session_id: str):
+    if not _database_configured():
+        return
     session = sessions.get(session_id)
     if session is None:
         return
@@ -95,6 +102,8 @@ def _persist_session(session_id: str):
 
 
 def _delete_persisted_session(session_id: str):
+    if not _database_configured():
+        return
     with _db_connect() as conn:
         conn.execute(
             f'DELETE FROM "{DATABASE_SCHEMA}".sessions WHERE session_id = %s',
@@ -103,6 +112,9 @@ def _delete_persisted_session(session_id: str):
 
 
 def _restore_sessions():
+    if not _database_configured():
+        logger.warning("DATABASE_URL is not resolved; using temporary in-memory sessions")
+        return
     with _db_connect() as conn:
         rows = conn.execute(
             f'SELECT session_id, data FROM "{DATABASE_SCHEMA}".sessions'
@@ -615,9 +627,12 @@ async def _cleanup_expired_sessions():
 
 @app.on_event("startup")
 async def startup():
-    _init_session_storage()
-    _restore_sessions()
-    logger.info("PostgreSQL session storage initialized; restored %s session(s)", len(sessions))
+    if _database_configured():
+        _init_session_storage()
+        _restore_sessions()
+        logger.info("PostgreSQL session storage initialized; restored %s session(s)", len(sessions))
+    else:
+        logger.warning("PostgreSQL is not configured; sessions are temporary until DATABASE_URL is linked in Render")
     asyncio.create_task(_cleanup_expired_sessions())
 
 
