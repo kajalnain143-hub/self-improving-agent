@@ -165,6 +165,7 @@ class SkillOptimizer:
         evals: list,
         max_rounds: int = 5,
         callback: Optional[Callable] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """Run the optimization loop with 3 ADK agents."""
 
@@ -196,6 +197,9 @@ class SkillOptimizer:
 
         # -- Rounds -----------------------------------------------------------
         for rnd in range(1, max_rounds + 1):
+            # Stop cleanly between rounds; an in-flight Gemini request is allowed to finish.
+            if should_stop and should_stop():
+                break
             await emit({"type": "experiment_start", "data": {"round": rnd}})
 
             # Analyst diagnoses worst failure
@@ -243,8 +247,19 @@ class SkillOptimizer:
                 },
             })
 
-        # -- Done -------------------------------------------------------------
+        # -- Done / stopped ---------------------------------------------------
         final_pct = baseline_pct
+        was_stopped = bool(should_stop and should_stop())
+        if was_stopped:
+            await emit({"type": "stopped", "data": {"final_score": final_pct}})
+            return {
+                "baseline_score": score_history[0],
+                "final_score": final_pct,
+                "improved_skill_md": current_md,
+                "score_history": score_history,
+                "mutation_log": mutation_log,
+                "stopped": True,
+            }
         await emit({
             "type": "complete",
             "data": {
