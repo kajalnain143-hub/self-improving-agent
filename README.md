@@ -253,3 +253,26 @@ Both servers support hot reload. Edit code and see changes immediately.
 This tool applies Andrej Karpathy's autoresearch methodology (using LLMs to iteratively improve their own prompts) to agent skills. The key insight: rather than manually tweaking prompts, define success criteria and let the AI optimize itself — now powered by a team of specialized ADK agents.
 
 Original concept: [https://github.com/karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+
+
+## Deploy to Render
+
+This repository can be deployed as two Render services:
+
+### 1. Backend (Web Service)
+- Runtime: Docker
+- Docker context: `./backend`
+- Dockerfile: `./backend/Dockerfile`
+- Health check path: `/health`
+- Environment variable: `FRONTEND_ORIGINS=https://<your-frontend>.onrender.com`
+
+The Gemini API key is entered in the app UI and sent to the backend for each run; do not commit API keys.
+
+### 2. Frontend (Static Site)
+- Build command: `cd frontend && npm ci && npm run build`
+- Publish directory: `frontend/out`
+- Build environment variable: `NEXT_PUBLIC_API_URL=https://<your-backend>.onrender.com`
+
+The frontend API URL is embedded at build time. If it changes, update the variable and redeploy the static site.
+
+**Important:** The backend currently keeps sessions in memory. On a free instance restart or scale-out, active sessions are lost; use persistent storage / a shared session store before production-scale use.
