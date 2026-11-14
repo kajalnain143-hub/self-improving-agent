@@ -365,7 +365,13 @@ async def start_optimization(session_id: str, request: StartRequest):
                 evals=session["evals"],
                 max_rounds=request.max_rounds,
                 callback=callback,
+                should_stop=lambda: session.get("stop_requested", False),
             )
+            if session.get("stop_requested") or result.get("stopped"):
+                session["status"] = "stopped"
+                if "event_queue" in session:
+                    await session["event_queue"].put(None)
+                return
             logger.info(f"Optimization complete: {result['baseline_score']}% -> {result['final_score']}%")
             # Don't overwrite final_result if callback already set it with transformed data
             if not session.get("final_result"):
