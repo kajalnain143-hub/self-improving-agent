@@ -15,6 +15,8 @@ import shutil
 import re
 import logging
 import traceback
+import psycopg
+from psycopg.types.json import Jsonb
 from adk_optimizer import SkillOptimizer
 
 logging.basicConfig(level=logging.INFO)
@@ -49,7 +51,71 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# In-memory cache backed by a dedicated PostgreSQL schema. The schema keeps this
+# application's tables isolated from other projects sharing the same free DB.
 sessions: Dict[str, dict] = {}
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_SCHEMA = os.getenv("DATABASE_SCHEMA", "self_improving_agent")
+
+
+def _db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required for persistent session storage")
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
+def _init_session_storage():
+    if not DATABASE_SCHEMA.replace("_", "").isalnum():
+        raise RuntimeError("Invalid DATABASE_SCHEMA")
+    with _db_connect() as conn:
+        conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{DATABASE_SCHEMA}"')
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{DATABASE_SCHEMA}".sessions (
+                session_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+
+def _persist_session(session_id: str):
+    session = sessions.get(session_id)
+    if session is None:
+        return
+    # asyncio.Queue is process-local and is recreated for each SSE connection.
+    payload = {k: v for k, v in session.items() if k != "event_queue"}
+    with _db_connect() as conn:
+        conn.execute(
+            f'''INSERT INTO "{DATABASE_SCHEMA}".sessions (session_id, data, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (session_id) DO UPDATE
+                SET data = EXCLUDED.data, updated_at = NOW()''',
+            (session_id, Jsonb(payload)),
+        )
+
+
+def _delete_persisted_session(session_id: str):
+    with _db_connect() as conn:
+        conn.execute(
+            f'DELETE FROM "{DATABASE_SCHEMA}".sessions WHERE session_id = %s',
+            (session_id,),
+        )
+
+
+def _restore_sessions():
+    with _db_connect() as conn:
+        rows = conn.execute(
+            f'SELECT session_id, data FROM "{DATABASE_SCHEMA}".sessions'
+        ).fetchall()
+    for session_id, data in rows:
+        # A running task cannot survive a process restart; preserve its data and
+        # mark it interrupted instead of pretending it is still running.
+        if data.get("status") == "running":
+            data["status"] = "interrupted"
+            data["error"] = "Server restarted while optimization was running."
+        sessions[session_id] = data
+        if data.get("status") == "interrupted":
+            _persist_session(session_id)
 
 
 class AnalyzeRequest(BaseModel):
@@ -117,6 +183,7 @@ def create_session_from_files(skill_files: dict, file_list: list) -> dict:
         "original_skill_md": skill_md,
         "created_at": time.time(),
     }
+    _persist_session(session_id)
     return {"session_id": session_id, "file_list": file_list, "metadata": metadata}
 
 
@@ -230,6 +297,7 @@ async def analyze_skill(request: AnalyzeRequest):
         session["scenarios"] = analysis["scenarios"]
         session["evals"] = analysis["evals"]
         session["status"] = "analyzed"
+        _persist_session(request.session_id)
         return {"scenarios": analysis["scenarios"], "evals": analysis["evals"]}
     except Exception as e:
         logger.error(f"Analysis error: {traceback.format_exc()}")
@@ -252,6 +320,7 @@ async def update_config(config: SessionConfig):
     session["scenarios"] = config.scenarios
     session["evals"] = config.evals
     session["status"] = "configured"
+    _persist_session(config.session_id)
     return {"status": "ok"}
 
 
@@ -357,6 +426,7 @@ async def start_optimization(session_id: str, request: StartRequest):
                 session["current_skill_md"] = data.get("improved_skill_md", "")
                 if "event_queue" in session:
                     await session["event_queue"].put(None)
+            _persist_session(session_id)
 
         try:
             result = await optimizer.optimize(
@@ -369,6 +439,7 @@ async def start_optimization(session_id: str, request: StartRequest):
             )
             if session.get("stop_requested") or result.get("stopped"):
                 session["status"] = "stopped"
+                _persist_session(session_id)
                 if "event_queue" in session:
                     await session["event_queue"].put(None)
                 return
@@ -400,10 +471,12 @@ async def start_optimization(session_id: str, request: StartRequest):
                 }
             session["current_skill_md"] = result["improved_skill_md"]
             session["status"] = "complete"
+            _persist_session(session_id)
         except Exception as e:
             logger.error(f"Optimization error: {traceback.format_exc()}")
             session["status"] = "error"
             session["error"] = str(e)
+            _persist_session(session_id)
             if "event_queue" in session:
                 await session["event_queue"].put({"type": "error", "data": {"message": str(e)}})
                 await session["event_queue"].put(None)
@@ -420,6 +493,7 @@ async def stop_optimization(session_id: str):
     session = sessions[session_id]
     session["stop_requested"] = True
     session["status"] = "stopped"
+    _persist_session(session_id)
     if "event_queue" in session:
         await session["event_queue"].put(None)
     return {"status": "stopped"}
@@ -531,12 +605,19 @@ async def _cleanup_expired_sessions():
         ]
         for sid in expired:
             del sessions[sid]
+            try:
+                _delete_persisted_session(sid)
+            except Exception:
+                logger.exception("Failed to delete expired persisted session %s", sid)
         if expired:
             logger.info(f"Cleaned up {len(expired)} expired session(s)")
 
 
 @app.on_event("startup")
 async def startup():
+    _init_session_storage()
+    _restore_sessions()
+    logger.info("PostgreSQL session storage initialized; restored %s session(s)", len(sessions))
     asyncio.create_task(_cleanup_expired_sessions())
 
 
